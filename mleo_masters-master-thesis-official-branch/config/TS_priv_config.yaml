@@ -1,0 +1,112 @@
+
+#I usually have this included so that my 'test/debugging' runs of the code don't clutter the repo or my proper experiment logging folder with outputs.
+hydra:
+  run:
+    dir: /raid/dlgroupmsc/logs/${now:%Y-%m-%d_%H-%M-%S}
+#Note that config hierarchy introduces the design problem of deciding where config options should reside :)
+#For example when working with EO data, is the crop size dataset dependent or not?
+defaults:
+  - _self_
+  - dataset: read_dataset
+  - transform: basic
+
+seed: 42
+device: cuda:0 #cuda:0 #or cpu, or cuda:# on machines with more than one GPU
+use_transform: True
+batch_size: 8
+eval_every: 1
+save_model_freq: 500 #Don't do this to often, max a couple of times over a couple of thousand epochs. If no intention of warm starting training it is not needed at all.
+val_batch_size: 2 #I typically set this as large as VRAM allows
+test_batch_size: 2
+num_workers: 6 #Set this based on machine, I think it's best to max it, usually faster training that way.
+lr: 0.0002
+max_epochs: 300
+save_optimizer: False #Set this to true if you want to be able to keep training the model at a later stage, as of now the code has no support for this.
+weight_decay: 0 #1e-4 #1e-4 #1e-5
+optimizer: adam
+beta1: 0.9
+momentum: 0.9
+loss_function: teacher_student_loss
+indices_to_use: None #[5,6,7,8,10,11] #if loss=CE_ignoring_indices
+ignore_last_classes: False #only for CE_tversky
+
+label_smoothing: 0 #only for CE_tversky, CE
+copy_and_paste: 0.0 #0.5, TURN OF JITTERING BEFORE USAGE
+frac_copy_samples: 0.4 
+
+loss_w: #for loss combos between CE, Dice and/or focal
+  ce_w: 0.01
+  focal_w: 0.1
+
+model:
+  n_class: 19 #13 for grouped, 19 for all
+  n_channels: 5 
+  channels: [0,1,2,3,4]
+  name: teacher_student
+  use_pretrained_net: False
+
+  overwrite:
+    overwriting_name: None
+    overwriting_net: None
+
+  pretrained:
+   pretrained_name: None
+   training_path: None
+
+  unet_predict_priv:
+    unet_channels: None
+
+  teacher_student:
+    student_name: unet
+    teacher_name: unet
+    teacher_path: /raid/dlgroupmsc/logs/best_100_w_priv #path to privileged trained on 100%, to use as teacher for 100%
+    teacher_channels: 5
+    teacher_spec_channels: [0,1,2,3,4]
+    student_channels: 5
+    student_spec_channels: [0,1,2,3,4]
+    alpha: 0.4
+    ts_loss: KL
+    student_loss: tversky
+    student_T: 1
+    teacher_T: 1
+    R: 100000
+
+  multi_teacher:
+    student_name: None
+    teacher_1_path: None
+    teacher_2_path: None
+    teacher_1_channels: None
+    teacher_1_spec_channels: None
+    teacher_2_channels: None
+    teacher_2_spec_channels: None
+    student_channels: None
+    student_spec_channels: None
+    alpha: None
+    ts_loss: None
+    student_T: None
+    teacher_T: None
+    R: None
+
+
+  resnet50:
+    pretrained: DeepLabV3_ResNet50_Weights.DEFAULT #None does not work, but they seem to want it
+    pretrained_backbone: ResNet50_Weights.IMAGENET1K_V2 #default, can also use enum, read docs
+ 
+  mtd:
+    reweight_late: False
+    mtd_weighting: 0.3 #0.3 for unet_mtd_senti
+    linear_mtd_preprocess: None
+    feature_block: 1
+
+noise:
+  noise: False
+  noise_type: zero_out #for training
+  noise_distribution_type: None #for training
+  stepwise_linear_function: function_2
+
+eval:
+  eval_type: test
+  eval_model: unet
+  eval_loss: tversky
+  eval_channels: 4
+  eval_path: /raid/dlgroupmsc/logs/2024-05-16_09-41-19

@@ -1,0 +1,373 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import util
+from tqdm import tqdm
+import cv2
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+from io import BytesIO
+from PIL import Image
+import torchvision.transforms as transforms
+
+
+class_names = [
+    "building",
+    "pervious surface",
+    "impervious surface",
+    "bare soil",
+    "water",
+    "coniferous",
+    "deciduous",
+    "brushwood",
+    "vineyard",
+    "herbaceous vegetation",
+    "agricultural land",
+    "plowed land",
+    "swimming pool",
+    "snow",
+    "clear cut",
+    "mixed",
+    "ligneous",
+    "greenhouse",
+    "other"
+]
+
+class_names_12 = ["building",
+    "pervious surface",
+    "impervious surface",
+    "bare soil",
+    "water",
+    "coniferous",
+    "deciduous",
+    "brushwood",
+    "vineyard",
+    "herbaceous vegetation",
+    "agricultural land",
+    "plowed land",
+    "other"]
+
+colormap = [
+    [255, 0, 255],    # Magenta
+    [128, 128, 128],  # Grey
+    [255, 0, 0],      # Red
+    [139, 69, 19],    # Brown
+    [0, 0, 255],      # Blue
+    [0, 100, 0],      # Dark Green
+    [0, 255, 155],    # Greenblue
+    [255, 165, 0],    # Orange
+    [128, 0, 128],    # Purple
+    [0, 220, 0],      # Green
+    [255, 255, 0],    # Yellow
+    [220, 245, 220],  # Beige
+    [64, 224, 228],   # Turquoise
+    [255, 255, 255],  # White
+    [100, 190, 160],  # Grey Green
+    [52, 61, 15],   # Brown Green
+    [200, 200, 50],   # Yellow Green
+    [190, 170, 220],  # Light Purple
+    [0, 0, 0]         # Black
+]
+
+def miou_prec_rec_writing(config, y_pred_list, y_list, part, writer, epoch):
+    y_pred_list = torch.tensor(np.concatenate(y_pred_list, axis=0))
+    y_list = torch.tensor(np.concatenate(y_list, axis=0))
+
+    y_pred_list = y_pred_list.view(-1)
+    y_list = y_list.view(-1)
+
+    #print(y_pred_list.element_size() * y_pred_list.numel()/1000000) 
+    #print(y_list.element_size()*y_list.numel()/1000000)
+
+    #for val: should be 13000*512*512*2 for both, seems correct, and then doubling that -> req 12GB-> too much
+
+    epoch_miou_prec_rec = torch.full((3, config.model.n_class), float('nan'))
+
+    for i in range(config.model.n_class):
+        y_flat_i = (y_list == i)
+        num_i = torch.count_nonzero(y_flat_i)
+        pred_flat_i = (y_pred_list == i)
+        num_pred_i = torch.count_nonzero(pred_flat_i)
+        intersection_i = torch.logical_and(y_flat_i, pred_flat_i)
+        union_i = torch.logical_or(y_flat_i, pred_flat_i)
+        num_intersection_i = torch.count_nonzero(intersection_i)
+        num_union_i = torch.count_nonzero(union_i)
+
+        if num_union_i > 0:
+            epoch_miou_prec_rec[0, i] = num_intersection_i.float() / num_union_i.float()
+        if num_pred_i > 0:
+            epoch_miou_prec_rec[1, i] = num_intersection_i.float() / num_pred_i.float()
+        if num_i > 0:
+            epoch_miou_prec_rec[2, i] = num_intersection_i.float() / num_i.float()
+
+    del y_pred_list, y_list
+
+    epoch_miou_prec_rec = torch.nan_to_num(epoch_miou_prec_rec, nan=0.0)
+    epoch_miou_prec_rec = epoch_miou_prec_rec.cpu().numpy()
+    #Results as mean over all
+    writer.add_scalar(part+'/miou', np.mean(epoch_miou_prec_rec[0,:]), epoch)
+    writer.add_scalar(part+'/precision', np.mean(epoch_miou_prec_rec[1,:]), epoch)
+    writer.add_scalar(part+'/recall', np.mean(epoch_miou_prec_rec[2,:]), epoch)
+    #First 12 classes only for ref
+    writer.add_scalar(part+'/miou first 12', np.mean(epoch_miou_prec_rec[0,:12]), epoch)
+    writer.add_scalar(part+'/precision first 12', np.mean(epoch_miou_prec_rec[1,:12]), epoch)
+    writer.add_scalar(part+'/recall first 12', np.mean(epoch_miou_prec_rec[2,:12]), epoch)
+    #Also add class specific values
+    writer.add_text(part+'/miou per class', ', '.join(map(str, epoch_miou_prec_rec[0,:])), epoch)
+    writer.add_text(part+'/precision per class', ', '.join(map(str, epoch_miou_prec_rec[1,:])), epoch)
+    writer.add_text(part+'/recall per class', ', '.join(map(str, epoch_miou_prec_rec[2,:])), epoch)
+    if config.loss_function == 'CE_ignoring_classes':
+        writer.add_scalar(part+'/miou [5,6,7,8,10,11]', np.mean(epoch_miou_prec_rec[0,config.indices_to_use]), epoch)
+        writer.add_scalar(part+'/precision [5,6,7,8,10,11]', np.mean(epoch_miou_prec_rec[1,config.indices_to_use]), epoch)
+        writer.add_scalar(part+'/recall [5,6,7,8,10,11]', np.mean(epoch_miou_prec_rec[2,config.indices_to_use]), epoch)
+
+    print('Epoch mean miou: '+str(np.mean(epoch_miou_prec_rec[0,:])))
+    print('Epoch mean precision: '+str(np.mean(epoch_miou_prec_rec[1,:])))
+    print('Epoch mean recall: '+str(np.mean(epoch_miou_prec_rec[2,:])))
+    writer.flush()
+
+def miou_prec_rec_writing_13(config, y_pred_list, y_list, part, writer, epoch):
+    y_pred_list = torch.tensor(np.concatenate(y_pred_list, axis=0), dtype=torch.uint8)
+    y_list = torch.tensor(np.concatenate(y_list, axis=0), dtype=torch.uint8)
+
+    # Flatten tensors
+    y_pred_list = y_pred_list.view(-1)
+    y_list = y_list.view(-1)
+    #print(y_pred_list.shape)
+
+    # Set values > 12 to 13
+    y_pred_list[y_pred_list > 11] = 13
+    y_list[y_list > 11] = 13
+
+    # Create an empty tensor for epoch_miou_prec_rec
+    epoch_miou_prec_rec = torch.full((3, 1), float('nan'))
+
+    # Calculate for class 13
+    y_flat_13 = y_list == 13
+    num_13 = torch.count_nonzero(y_flat_13)
+    pred_flat_13 = y_pred_list == 13
+    num_pred_13 = torch.count_nonzero(pred_flat_13)
+    intersection_13 = torch.logical_and(y_flat_13, pred_flat_13)
+    union_13 = torch.logical_or(y_flat_13, pred_flat_13)
+    num_intersection_13 = torch.count_nonzero(intersection_13)
+    num_union_13 = torch.count_nonzero(union_13)
+
+    del y_list, y_pred_list
+
+    if num_union_13 > 0:
+        epoch_miou_prec_rec[0, 0] = num_intersection_13.float() / num_union_13.float()
+    if num_pred_13 > 0:
+        epoch_miou_prec_rec[1, 0] = num_intersection_13.float() / num_pred_13.float()
+    if num_13 > 0:
+        epoch_miou_prec_rec[2, 0] = num_intersection_13.float() / num_13.float()
+
+    # Save into writer
+    writer.add_scalar(part+'/miou fixed 13th class', epoch_miou_prec_rec[0, 0].item(), epoch)
+    writer.add_scalar(part+'/precision fixed 13th class', epoch_miou_prec_rec[1, 0].item(), epoch)
+    writer.add_scalar(part+'/recall fixed 13th class', epoch_miou_prec_rec[2, 0].item(), epoch)
+    writer.flush()
+
+import dask.array as da
+
+def conf_matrix(config, y_pred_list, y_list, writer, epoch, only_first=False):
+    y_pred_list = torch.tensor(np.concatenate(y_pred_list, axis=0))
+    y_list = torch.tensor(np.concatenate(y_list, axis=0))
+
+    y_pred_list = y_pred_list.view(-1)
+    y_list = y_list.view(-1)
+
+    if only_first:
+        mask = y_pred_list >= 12
+        y_pred_list[mask] = 12
+        mask = y_list >= 12
+        y_list[mask] = 12
+        
+
+    y_list = y_list.cpu().numpy()
+    #da may speed things up, but unclear and seems to return tuple
+    #y_list = da.from_array(y_list)
+    y_pred_list = y_pred_list.cpu().numpy()
+    #y_pred_list = da.from_array(y_pred_list)
+    #cm = da.compute(confusion_matrix(y_list, y_pred_list))
+    cm = confusion_matrix(y_list, y_pred_list)
+    cm = cm.astype('float') / cm.sum(axis=1)[:,np.newaxis]
+
+    # Create a confusion matrix plot
+    fig, ax = plt.subplots(figsize=(10, 10))
+    cax = ax.matshow(cm, cmap=plt.cm.Blues)
+    plt.colorbar(cax)
+
+    # Set axis labels to class names
+    if only_first:
+        ax.set_xticks(np.arange(len(class_names_12)))
+        ax.set_yticks(np.arange(len(class_names_12)))
+        ax.set_xticklabels(class_names_12, rotation=90)
+        ax.set_yticklabels(class_names_12)
+    else:
+        ax.set_xticks(np.arange(len(class_names)))
+        ax.set_yticks(np.arange(len(class_names)))
+        ax.set_xticklabels(class_names, rotation=90)
+        ax.set_yticklabels(class_names)
+
+    # Display the numbers inside the matrix
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            value = cm[i, j]
+            formatted_value = '{:.2f}'.format(value)
+            ax.text(x=j, y=i, s=formatted_value, va='center', ha='center', color='white' if value > cm.max()/2 else 'black')
+
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.title('Confusion Matrix')
+
+    # Save the plot to a buffer
+    buf = BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+
+     # Convert buffer to PIL Image
+    image = Image.open(buf)
+
+    # Convert PIL Image to tensor
+    transform = transforms.ToTensor()
+    cm_image = transform(image)
+
+    # Add confusion matrix image to TensorBoard
+    writer.add_image('epoch: ' +str(epoch) +' Val/confusion_matrix', cm_image, epoch)
+
+    buf.close()
+    plt.close(fig)
+
+
+def label_image(config, writer):
+    legend_image = np.zeros((config.model.n_class * 30, 100, 3), dtype=np.uint8)
+
+    # Populate the legend image with class labels and corresponding colors
+    for class_label in range(config.model.n_class):
+        legend_image[class_label * 30:(class_label + 1) * 30, :, :] = colormap[class_label]
+
+    # Create class labels as text and overlay them on the legend
+    class_labels = [f'Class {i}' for i in range(config.model.n_class)]
+    for i, label in enumerate(class_labels):
+        plt.text(120, i * 30 + 15, label, fontsize=12, color='white', va='center')
+
+    # Save the legend image
+    plt.imsave('legend.png', legend_image)
+
+    # Load the saved legend image and convert it to a tensor
+    legend_image = plt.imread('legend.png')
+    legend_tensor = torch.from_numpy(legend_image.transpose(2, 0, 1))
+
+    # Add the legend image to TensorBoard
+    writer.add_image('Legend Image', legend_tensor, 0)
+    writer.add_text("Class Names", "\n".join(class_names), 0)
+
+def is_subsequence_present(lst, subsequence):
+    """Check if subsequence is present in lst."""
+    for i in subsequence:
+        if i not in lst:
+            return False
+    return True
+
+def priv_info_image(channel, index, x_tensor, epoch, writer, n_channels=5):
+    if channel > x_tensor.shape[0]:
+        return
+    elif n_channels != 1:
+        x_priv = x_tensor[channel, :, :].unsqueeze(0)
+    else:
+        x_priv = x_tensor[0,:,:].unsqueeze(0)
+    #print(x_priv.shape)
+    #Not ideal normalization to be honest, as we don't know how strong the signal is
+    min_vals = x_priv.view(1, -1).min(dim=1)[0].unsqueeze(-1).unsqueeze(-1)
+    max_vals = x_priv.view(1, -1).max(dim=1)[0].unsqueeze(-1).unsqueeze(-1)
+    x_priv = (x_priv - min_vals) / (max_vals - min_vals)
+    #print(x_priv.shape)
+    #Have to normalize x and x_priv to [0,1]
+    if channel == 3:
+        writer.add_image('Epoch: ' + str(epoch) + ', Val/IR priv info, batch: ' + str(index), x_priv, epoch)
+    elif channel == 4:
+        writer.add_image('Epoch: ' + str(epoch) + ', Val/height map priv info, batch: ' + str(index), x_priv, epoch)
+
+
+def save_image(index, x, y_pred, y, epoch, config, writer):
+    channels = np.array(config.model.channels)
+    #print(x.shape) #np array, shape C,512, 512
+    #print(y_pred.shape) #512,512
+    #print(y.shape) #512, 512
+    #Unnormalize x and divide by 255 to get range [0,1]
+
+    if is_subsequence_present(channels, [0,1,2]):
+        x_temp = np.transpose(x[:3], (1,2,0)).astype(float)
+        x_temp *= np.array(config.dataset.std)[:3]
+        x_temp += np.array(config.dataset.mean)[:3]
+        x_temp = np.floor(x_temp)
+        x_temp = cv2.cvtColor(x_temp.astype(np.uint8), cv2.COLOR_BGR2RGB) #convert from BGR to RGB
+        x_temp = np.transpose(x_temp, (2,0,1))
+        
+        x[:3] = x_temp/255.0
+        x_tensor = torch.from_numpy(x)
+        #print(x_tensor.shape)
+        #print(x_tensor.dtype)
+        writer.add_image('Epoch: ' + str(epoch) + ', Val/x, batch: ' + str(index), x_tensor[:3], epoch)
+
+    colored_y = np.zeros((3, y.shape[0], y.shape[1]), dtype=np.uint8)
+    colored_y_pred = np.zeros((3, y_pred.shape[0], y_pred.shape[1]), dtype=np.uint8)
+
+    # Iterate over each class and color the masks
+    for class_label in range(config.model.n_class):
+        # Create boolean masks for the current class
+        class_mask_y = (y == class_label)
+        class_mask_y_pred = (y_pred == class_label)
+
+        # Color the masks
+        for c in range(3):  # Iterate over color channels (R, G, B)
+            colored_y[c][class_mask_y] = colormap[class_label][c]
+            colored_y_pred[c][class_mask_y_pred] = colormap[class_label][c]
+
+    x_tensor = torch.from_numpy(x)
+    
+    if 3 in channels:
+        #print('skip print')
+        priv_info_image(3, index, x_tensor, epoch, writer, config.model.n_channels)
+    if 4 in channels:
+        #print('skip print')
+        priv_info_image(4, index, x_tensor, epoch, writer, config.model.n_channels)
+        
+    
+    colored_y_tensor = torch.from_numpy(colored_y)
+    colored_y_pred_tensor = torch.from_numpy(colored_y_pred)
+    colored_y_tensor = colored_y_tensor/255.0 
+    colored_y_pred_tensor = colored_y_pred_tensor/255.0
+    #print('shapes')
+    #print(x_tensor.shape)
+    #print(colored_y_tensor.shape)
+    #print(colored_y_pred_tensor.shape)
+    #print(type(x_tensor), x_tensor.dtype)
+    #print(type(colored_y_tensor), colored_y_tensor.dtype)
+    #print(type(colored_y_pred_tensor), colored_y_tensor.dtype)
+    #print(f"colored_y_tensor: max={colored_y_tensor.max().item()}, min={colored_y_tensor.min().item()}")
+    #print(f"colored_y_pred_tensor: max={colored_y_pred_tensor.max().item()}, min={colored_y_pred_tensor.min().item()}")
+    
+    writer.add_image('Epoch: ' + str(epoch) + ', Val/y, batch: ' + str(index), colored_y_tensor, epoch) #unsqueeze adds dim
+    writer.add_image('Epoch: ' + str(epoch) + ', Val/y_pred, batch: ' + str(index), colored_y_pred_tensor, epoch)
+
+
+def save_senti_image(index, senti, epoch, config, writer):
+            
+    #Unnormalize x and divide by 255 to get range [0,1]
+    BGR_indeces = [2,1,0]
+    senti_temp = senti[BGR_indeces, :, :].astype(float)
+    senti_temp = np.transpose(senti[BGR_indeces], (1,2,0)).astype(float)
+    senti_temp *= np.array(config.dataset.std_senti)[BGR_indeces]
+    senti_temp += np.array(config.dataset.mean_senti)[BGR_indeces]
+    senti_temp = np.floor(senti_temp)
+    senti_temp = cv2.cvtColor(senti_temp.astype(np.uint8), cv2.COLOR_BGR2RGB) #convert from BGR to RGB
+    senti_temp = np.transpose(senti_temp, (2,0,1))
+    senti[BGR_indeces] = senti_temp/255.0
+    senti_plot = senti_temp/255.0
+    senti_tensor = torch.from_numpy(senti_plot)            
+
+    writer.add_image('Epoch: ' + str(epoch) + ', Val/senti, batch: ' + str(index), senti_tensor, epoch)
+    writer.flush()
