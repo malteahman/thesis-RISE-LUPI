@@ -7,9 +7,9 @@ Folder with all config files, these will be commented in further detail in the e
 # Dataset folder
 
 ## Paths folder
-Paths contains all paths for the used 5 % of the data, to assure the same images was used on every 5 % run. Will have to be regenerated if file structure is different.
+Paths contain all paths for the used 5 % of the data, to assure the same images was used on every 5 % run. Will have to be regenerated if file structure is different.
 
-## examlple_set.py
+## example_set.py
 Outdated for inspiration.
 
 ## read_dataset.py - IMPORTANT FILE
